@@ -1,0 +1,27 @@
+# Requirements for Stylised_Handwriting_Gen
+# Optimized for Python 3.14 environment
+
+# Core Deep Learning Framework
+# Replaces tensorflow==2.3.0 (legacy Python 3.8 only)
+# Note: TensorFlow 2.22.0rc0+ provides the official cp314 binary wheels for Python 3.14
+tensorflow>=2.22.0rc0
+
+# Visualization and Canvas Rendering
+# Replaces matplotlib==3.2.2
+# Matplotlib 3.10+ provides pre-built binary wheels for Python 3.14 (3.11.2 installed)
+matplotlib>=3.10.0
+
+# Numerical Computing
+# Replaces numpy==1.18.5
+# Python 3.14 requires NumPy 2.x (NumPy 2.5.4 installed)
+numpy>=2.0.0
+
+# Image Processing (Writer style sample reading)
+# Replaces pillow==8.0.1
+# Pillow 11+ provides cp314 binary wheels for Python 3.14 (13.0.0 installed)
+pillow>=11.0.0
+
+# Model Weight Storage (HDF5 loader)
+# Replaces h5py==2.10.0
+# h5py 3.14+ provides pre-built binary wheels for Python 3.14
+h5py>=3.14.0
