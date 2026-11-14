@@ -1,260 +1,267 @@
-import streamlit as st
-
-# Must be the first Streamlit call
-st.set_page_config(
-    page_title="Handwriting Style Transfer",
-    page_icon="✍️",
-    layout="wide",
-)
-
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # force CPU; remove if GPU available
-
-import io
+import sys
 import tempfile
+import uuid
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
+
+# Make relative paths (./assets, ./weights) work no matter where Streamlit is launched from
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(APP_DIR)
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
 import numpy as np
+import streamlit as st
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import gdown
 
-# ------------------------------------------------------------------
-# Model weights download (Google Drive)
-# ------------------------------------------------------------------
-WEIGHTS_PATH = "./weights/model_weights.h5"
-WEIGHTS_FILE_ID = "1U1h_sfTx2F51vmBGnELfZvKenospyITo"
+st.set_page_config(page_title="Stylised Handwriting Generator", page_icon="✍️", layout="wide")
+
+ASSET_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+DEFAULT_WEIGHTS = "./weights/model_weights.h5"
 
 
-def ensure_weights():
-    if os.path.exists(WEIGHTS_PATH):
-        return
-    os.makedirs(os.path.dirname(WEIGHTS_PATH), exist_ok=True)
-    with st.spinner("Downloading model weights (first run only)…"):
-        try:
-            gdown.download(
-                id=WEIGHTS_FILE_ID,
-                output=WEIGHTS_PATH,
-                quiet=False,
-            )
-        except Exception as e:
-            st.error(
-                "Could not download model weights from Google Drive.\n\n"
-                f"Details: {e}\n\n"
-                "Make sure the file is publicly shared and that the ID is correct."
-            )
-            st.stop()
-
-
-# ------------------------------------------------------------------
-# Cached resources
-# ------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading diffusion model…")
-def load_model():
+# --------------------------------------------------------------------------
+# Cached heavy resources
+# --------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Loading TensorFlow and model weights (first run only)...")
+def load_models(weights_path: str, channels: int, num_attlayers: int):
     import tensorflow as tf
     import nn
+    import utils
 
-    model = nn.DiffusionWriter(num_layers=2, c1=128, c2=192, c3=256)
-    # Warm-up call so the model builds variables before loading
+    c1 = channels
+    c2 = c1 * 3 // 2
+    c3 = c1 * 2
+
+    style_extractor = nn.StyleExtractor()
+    model = nn.DiffusionWriter(num_layers=num_attlayers, c1=c1, c2=c2, c3=c3)
+
+    # The model must be called once before weights can be loaded
     _stroke = tf.random.normal([1, 400, 2])
     _text = tf.random.uniform([1, 40], dtype=tf.int32, maxval=50)
     _noise = tf.random.uniform([1, 1])
     _style_vector = tf.random.normal([1, 14, 1280])
     _ = model(_stroke, _text, _noise, _style_vector)
-    model.load_weights(WEIGHTS_PATH)
-    return model
+    model.load_weights(weights_path)
 
-
-@st.cache_resource(show_spinner="Loading style extractor…")
-def load_style_extractor():
-    import nn
-    return nn.StyleExtractor()
-
-
-# ------------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------------
-def read_writer_image(file_obj):
-    import preprocessing
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        tmp.write(file_obj.getvalue())
-        tmp_path = tmp.name
-    try:
-        img = preprocessing.read_img(tmp_path, 96)
-    finally:
-        os.unlink(tmp_path)
-    return img
-
-
-def default_writer_image():
-    import preprocessing
-    if os.path.isdir("./assets"):
-        assets = [
-            f for f in os.listdir("./assets")
-            if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
-        ]
-        if assets:
-            return preprocessing.read_img(os.path.join("./assets", assets[0]), 96)
-    # Blank white canvas fallback
-    return np.full((96, 400, 1), 255, dtype=np.uint8)
-
-
-def strokes_to_png(strokes, linewidth=1.5):
-    """Exact replica of utils.show() rendering logic."""
-    pos = np.cumsum(strokes[:, :2], axis=0)
-    prev_ind = 0
-    W, H = np.max(pos, axis=0) - np.min(pos, axis=0)
-    
-    # Match local utils.show logic exactly
-    scale = 1
-    fig_w = scale * W / H if H > 0 else scale
-    fig_h = scale
-
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    for ind, val in enumerate(strokes[:, 2]):
-        if val > 0.5:
-            if ind > prev_ind:
-                ax.plot(
-                    pos[prev_ind:ind, 0],
-                    pos[prev_ind:ind, 1],
-                    color="black",
-                    linewidth=linewidth,
-                )
-            prev_ind = ind
-    ax.axis("off")
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight", dpi=150, facecolor="white")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def run_generation(
-    text, style_vector, char_spacing, word_spacing, italics, boldness, seqlen=None
-):
-    import tensorflow as tf
-    import utils
-    import style_controller
-
-    model = load_model()
     tokenizer = utils.Tokenizer()
     beta_set = utils.get_beta_set()
+    return model, style_extractor, tokenizer, beta_set
 
-    if not seqlen or seqlen <= 0:
-        seqlen = len(text) * 16
-    seqlen = seqlen - (seqlen % 8) + 8
 
-    raw = utils.run_batch_inference(
+def list_assets():
+    if not os.path.isdir("./assets"):
+        return []
+    return sorted(f for f in os.listdir("./assets") if f.lower().endswith(ASSET_EXTS))
+
+
+def generate(text, writer_path, opts, weights_path, channels, num_attlayers):
+    import tensorflow as tf
+    import utils
+    import preprocessing
+
+    model, style_extractor, tokenizer, beta_set = load_models(weights_path, channels, num_attlayers)
+
+    if opts["seed"] is not None:
+        tf.random.set_seed(int(opts["seed"]))
+        np.random.seed(int(opts["seed"]))
+
+    writer_img = tf.expand_dims(preprocessing.read_img(writer_path, 96), 0)
+    style_vector = style_extractor(writer_img)
+
+    # Multi-line text: pass None so every line gets its own length-based timesteps
+    if "\n" in text:
+        time_steps = None
+    elif opts["seqlen"]:
+        time_steps = int(opts["seqlen"])
+        time_steps = time_steps - (time_steps % 8) + 8
+    else:
+        time_steps = len(text) * 16
+        time_steps = time_steps - (time_steps % 8) + 8
+
+    out_path = os.path.join(tempfile.gettempdir(), f"hw_{uuid.uuid4().hex}.png")
+
+    utils.run_batch_inference(
         model,
         beta_set,
         text,
         style_vector,
         tokenizer=tokenizer,
-        time_steps=seqlen,
-        diffusion_mode="new",
+        time_steps=time_steps,
+        diffusion_mode=opts["diffmode"],
         show_samples=False,
-        path=None,
-        char_spacing=0.0,
-        word_spacing=0.0,
-        italics=0.0,
-        boldness=0.0,
-    )[0]
-
-    config = style_controller.StyleConfig()
-    
-    # We map the -3.0 to 3.0 sliders back into the safe -1.0 to 1.0 range
-    # for the underlying math, but keep the UI responsive.
-    safe_char = np.clip(char_spacing / 3.0, -1.0, 1.0)
-    safe_word = np.clip(word_spacing / 3.0, -1.0, 1.0)
-    safe_italics = np.clip(italics / 3.0, -1.0, 1.0)
-    safe_boldness = np.clip(boldness / 3.0, -1.0, 1.0)
-
-    styled, lw = style_controller.apply_all_styles(
-        raw,
-        text,
-        char_spacing=safe_char,
-        word_spacing=safe_word,
-        italics=safe_italics,
-        boldness=safe_boldness,
-        config=config,
+        path=out_path,
+        char_spacing=opts["char_spacing"],
+        word_spacing=opts["word_spacing"],
+        italics=opts["italics"],
+        boldness=opts["boldness"],
+        text_size=opts["text_size"],
+        line_spacing=opts["line_spacing"],
+        width=opts["width"],
+        height=opts["height"],
+        autowrap=1 if opts["autowrap"] else 0,
+        fit_overflow=opts["fit_overflow"],
     )
-    return styled, lw
+    plt.close("all")
+
+    with open(out_path, "rb") as f:
+        png_bytes = f.read()
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
+    return png_bytes
 
 
-# ------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # UI
-# ------------------------------------------------------------------
-st.title("✍️ Handwriting Style Transfer")
-
-ensure_weights()
+# --------------------------------------------------------------------------
+st.title("✍️ Stylised Handwriting Generator")
+st.caption("Diffusion-based handwriting synthesis with style controls for spacing, slant, boldness, size and layout.")
 
 with st.sidebar:
-    st.header("📝 Input")
-    text = st.text_input("Text to generate", value="Hello World", max_chars=200)
-
-    st.header("🎨 Style Controls")
-    char_spacing = st.slider("Character spacing", -3.0, 3.0, 0.0, 0.1)
-    word_spacing = st.slider("Word spacing", -3.0, 3.0, 0.0, 0.1)
-    italics = st.slider("Italics (slant)", -3.0, 3.0, 0.0, 0.1)
-    boldness = st.slider("Boldness", -3.0, 3.0, 0.0, 0.1)
-
-    st.header("⚙️ Options")
-    writer_file = st.file_uploader(
-        "Writer style reference (optional)",
-        type=["png", "jpg", "jpeg", "tif", "tiff"],
+    st.header("Writer style")
+    source_mode = st.radio(
+        "Handwriting source",
+        ["Upload an image", "Choose from assets", "Random from assets"],
     )
-    
-    if not os.path.isdir("./assets") and writer_file is None:
-        st.warning("⚠️ No `assets/` folder found. Please upload a reference image to get proper handwriting!")
-        
-    generate_btn = st.button("✨ Generate", type="primary", use_container_width=True)
 
-if "result" not in st.session_state:
-    st.session_state.result = None
+    uploaded = None
+    chosen_asset = None
+    assets = list_assets()
 
-if generate_btn:
-    if not text.strip():
-        st.warning("Please enter some text.")
+    if source_mode == "Upload an image":
+        uploaded = st.file_uploader(
+            "Upload a sample of the handwriting (one line of text works best)",
+            type=["png", "jpg", "jpeg", "tif", "tiff"],
+        )
+        if uploaded is not None:
+            st.image(uploaded, caption="Writer sample", use_container_width=True)
+    elif source_mode == "Choose from assets":
+        if assets:
+            chosen_asset = st.selectbox("Asset", assets)
+            st.image(os.path.join("./assets", chosen_asset), use_container_width=True)
+        else:
+            st.warning("No images found in ./assets")
     else:
-        try:
-            with st.spinner("Generating handwriting — this can take a minute…"):
-                style_extractor = load_style_extractor()
+        if not assets:
+            st.warning("No images found in ./assets")
 
-                if writer_file is not None:
-                    writer_img = read_writer_image(writer_file)
-                else:
-                    writer_img = default_writer_image()
+    st.header("Style controls")
+    char_spacing = st.slider("Character spacing", -1.0, 1.0, 0.0, 0.05)
+    word_spacing = st.slider("Word spacing", -1.0, 1.0, 0.0, 0.05)
+    italics = st.slider("Italics (slant)", -1.0, 1.0, 0.0, 0.05)
+    boldness = st.slider("Boldness", -1.0, 1.0, 0.0, 0.05)
+    text_size = st.slider("Text size", -1.0, 1.0, 0.0, 0.05)
+    line_spacing = st.slider("Line spacing (multiline)", -1.0, 1.0, 0.0, 0.05)
 
-                import tensorflow as tf
-                style_vec = style_extractor(tf.expand_dims(writer_img, 0))
+    st.header("Layout")
+    autowrap = st.checkbox("Auto-wrap words", value=False)
+    fit_overflow = st.checkbox("Shrink to fit if text overflows canvas", value=False)
+    c1, c2 = st.columns(2)
+    width = c1.number_input("Width (px, 0 = auto)", min_value=0, max_value=4000, value=0, step=50)
+    height = c2.number_input("Height (px, 0 = auto)", min_value=0, max_value=4000, value=0, step=50)
 
-                styled, lw = run_generation(
-                    text,
-                    style_vec,
-                    char_spacing,
-                    word_spacing,
-                    italics,
-                    boldness,
-                )
+    with st.expander("Advanced"):
+        diffmode = st.selectbox(
+            "Diffusion mode", ["new", "standard"],
+            help="'new' = Eq. 12 from the paper (default). 'standard' = Eq. 9.",
+        )
+        seqlen = st.number_input(
+            "Sequence length (0 = 16 × text length)", min_value=0, max_value=8000, value=0, step=8,
+            help="Single-line text only. Multi-line text sizes each line automatically.",
+        )
+        use_seed = st.checkbox("Fix random seed (reproducible output)")
+        seed = st.number_input("Seed", min_value=0, value=42, step=1, disabled=not use_seed)
+        weights_path = st.text_input("Weights path", DEFAULT_WEIGHTS)
+        channels = st.number_input("Channels (match training)", min_value=32, max_value=512, value=128, step=32)
+        num_attlayers = st.number_input("Attention layers (match training)", min_value=1, max_value=8, value=2, step=1)
 
-                st.session_state.result = {
-                    "mod_png": strokes_to_png(styled, linewidth=lw),
-                    "text": text,
-                }
-        except Exception as e:
-            st.error(f"Generation failed: {e}")
+st.subheader("Text")
+text = st.text_area(
+    "Text to write (press Enter for a new line)",
+    value="Generating text",
+    height=160,
+)
+st.caption(
+    "Supported characters: letters, digits and . ? ! , ' \" - and space. "
+    "Anything else is replaced with '_'."
+)
 
-if st.session_state.result is not None:
-    res = st.session_state.result
-    st.subheader("Generated")
-    st.image(res["mod_png"], use_container_width=True)
+go = st.button("Generate handwriting", type="primary")
+
+if go:
+    clean_text = text.replace("\r\n", "\n").strip("\n")
+    if not clean_text.strip():
+        st.error("Please enter some text.")
+        st.stop()
+
+    if not os.path.exists(weights_path):
+        st.error(f"Weights file not found at `{weights_path}`.")
+        st.stop()
+
+    # Resolve the writer image
+    tmp_upload_path = None
+    if source_mode == "Upload an image":
+        if uploaded is None:
+            st.error("Please upload a handwriting image in the sidebar.")
+            st.stop()
+        suffix = os.path.splitext(uploaded.name)[1] or ".png"
+        tmp_upload_path = os.path.join(tempfile.gettempdir(), f"writer_{uuid.uuid4().hex}{suffix}")
+        with open(tmp_upload_path, "wb") as f:
+            f.write(uploaded.getbuffer())
+        writer_path = tmp_upload_path
+    elif source_mode == "Choose from assets":
+        if not chosen_asset:
+            st.error("No asset selected.")
+            st.stop()
+        writer_path = os.path.join("./assets", chosen_asset)
+    else:
+        if not assets:
+            st.error("No images in ./assets to pick from.")
+            st.stop()
+        writer_path = os.path.join("./assets", assets[np.random.randint(0, len(assets))])
+
+    opts = dict(
+        char_spacing=char_spacing,
+        word_spacing=word_spacing,
+        italics=italics,
+        boldness=boldness,
+        text_size=text_size,
+        line_spacing=line_spacing,
+        autowrap=autowrap,
+        fit_overflow=fit_overflow,
+        width=int(width) if width else None,
+        height=int(height) if height else None,
+        diffmode=diffmode,
+        seqlen=int(seqlen) if seqlen else None,
+        seed=int(seed) if use_seed else None,
+    )
+
+    try:
+        with st.spinner("Running diffusion (60 denoising steps per line)... this can take a while on CPU."):
+            png = generate(clean_text, writer_path, opts, weights_path, int(channels), int(num_attlayers))
+        st.session_state["result_png"] = png
+    except Exception as e:  # surface errors in the UI instead of a blank page
+        st.exception(e)
+    finally:
+        if tmp_upload_path and os.path.exists(tmp_upload_path):
+            try:
+                os.remove(tmp_upload_path)
+            except OSError:
+                pass
+
+if "result_png" in st.session_state:
+    st.subheader("Result")
+    st.image(st.session_state["result_png"], use_container_width=True)
     st.download_button(
-        "📥 Download image",
-        data=res["mod_png"],
+        "Download PNG",
+        data=st.session_state["result_png"],
         file_name="handwriting.png",
         mime="image/png",
-        use_container_width=True,
     )
-else:
-    st.info("Configure the controls on the left and click **✨ Generate** to create handwriting.")
