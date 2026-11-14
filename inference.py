@@ -1,11 +1,13 @@
-import tensorflow as tf
+import os
+import sys
+import tempfile
+import argparse
+
+os.environ.setdefault('MPLCONFIGDIR', tempfile.gettempdir())
+
 import numpy as np
 import matplotlib.pyplot as plt
 import utils
-import nn
-import argparse
-import os
-import preprocessing
 
 def main():
     parser = argparse.ArgumentParser()  
@@ -27,11 +29,28 @@ def main():
     parser.add_argument('--word_spacing', help='word spacing style control (-1.0 to +1.0, default 0.0)', default=0.0, type=float)
     parser.add_argument('--italics', help='italics slant style control (-1.0 to +1.0, default 0.0)', default=0.0, type=float)
     parser.add_argument('--boldness', help='boldness stroke thickness style control (-1.0 to +1.0, default 0.0)', default=0.0, type=float)
+    parser.add_argument('--text_size', help='text size style control (-1.0 to +1.0, default 0.0)', default=0.0, type=float)
+    parser.add_argument('--line_spacing', help='line spacing style control for multiline (-1.0 to +1.0, default 0.0)', default=0.0, type=float)
+    parser.add_argument('--width', help='target canvas width in pixels', default=None, type=int)
+    parser.add_argument('--height', help='target canvas height in pixels', default=None, type=int)
+    parser.add_argument('--autowrap', help='automatic word wrapping: 0 = disabled (default), 1 = enabled', default=0, type=int, choices=[0, 1])
     
     args = parser.parse_args()
     if not args.show:
         plt.switch_backend('Agg')
-    timesteps = len(args.textstring) * 16 if args.seqlen is None else args.seqlen
+
+    try:
+        import tensorflow as tf
+        import nn
+        import preprocessing
+    except ImportError as e:
+        print(f"Error: TensorFlow and neural network components required for diffusion inference: {e}")
+        print("Note: Stable official TensorFlow currently supports Python 3.10 - 3.12.")
+        sys.exit(1)
+
+    textstring = args.textstring.replace('\\n', '\n')
+
+    timesteps = len(textstring) * 16 if args.seqlen is None else args.seqlen
     timesteps = timesteps - (timesteps%8) + 8 
     #must be divisible by 8 due to downsampling layers
 
@@ -62,11 +81,14 @@ def main():
 
     writer_img = tf.expand_dims(preprocessing.read_img(sourcename, 96), 0)
     style_vector = style_extractor(writer_img)
-    utils.run_batch_inference(model, beta_set, args.textstring, style_vector, 
+    utils.run_batch_inference(model, beta_set, textstring, style_vector, 
                               tokenizer=tokenizer, time_steps=timesteps, diffusion_mode=args.diffmode, 
                               show_samples=args.show, path=args.name,
                               char_spacing=args.char_spacing, word_spacing=args.word_spacing,
-                              italics=args.italics, boldness=args.boldness)
+                              italics=args.italics, boldness=args.boldness,
+                              text_size=args.text_size, line_spacing=args.line_spacing,
+                              width=args.width, height=args.height,
+                              autowrap=args.autowrap)
 
 if __name__ == '__main__':
     main()

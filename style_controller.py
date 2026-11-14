@@ -19,6 +19,10 @@ from typing import List, Tuple, Optional, Dict, Any, Union
 import numpy as np
 
 
+DEFAULT_MAX_CANVAS_WIDTH: int = 1400
+DEFAULT_MAX_CANVAS_HEIGHT: int = 1400
+
+
 @dataclass
 class StyleConfig:
     """Central configuration for mathematical handwriting style controllers."""
@@ -48,6 +52,21 @@ class StyleConfig:
 
     # Whether to clamp style control values to [-1.0, 1.0]
     clamp_controls: bool = True
+
+    min_text_size_scale: float = 0.5
+    max_text_size_scale: float = 2.0
+
+    default_line_spacing: float = 0.0
+    base_line_gap_ratio: float = 0.5
+    max_line_gap_displacement: float = 3.0
+
+    default_canvas_width: int = 1400
+    default_canvas_height: int = 400
+    max_canvas_width: int = DEFAULT_MAX_CANVAS_WIDTH
+    max_canvas_height: int = DEFAULT_MAX_CANVAS_HEIGHT
+    default_dpi: int = 100
+    default_margin_ratio: float = 0.05
+    pixels_per_unit: float = 15.0
 
 
 # ==============================================================================
@@ -479,6 +498,103 @@ def apply_italics(
     return absolute_to_relative(pos, pen_lifts, orig_dtype=strokes.dtype)
 
 
+def compute_text_size_scale(
+    text_size: float,
+    config: Optional[StyleConfig] = None
+) -> float:
+    """
+    Computes the uniform scaling factor s corresponding to the text_size control value.
+
+    Mapping:
+        -1.0 -> config.min_text_size_scale (default 0.5: 50% size)
+         0.0 -> 1.0 (exact original handwriting size)
+        +1.0 -> config.max_text_size_scale (default 2.0: 200% size)
+
+    Parameters:
+        text_size: Control value in [-1.0, 1.0].
+        config: Optional StyleConfig instance.
+
+    Returns:
+        s: Float uniform scaling factor.
+    """
+    if config is None:
+        config = StyleConfig()
+
+    if config.clamp_controls:
+        text_size = float(np.clip(text_size, -1.0, 1.0))
+
+    if text_size == 0.0:
+        return 1.0
+    elif text_size > 0.0:
+        return 1.0 + text_size * (config.max_text_size_scale - 1.0)
+    else:
+        return 1.0 + text_size * (1.0 - config.min_text_size_scale)
+
+
+def apply_text_size(
+    strokes: np.ndarray,
+    text_size: float,
+    config: Optional[StyleConfig] = None
+) -> np.ndarray:
+    """
+    Applies uniform scaling to handwriting stroke coordinates to control overall text size.
+
+    Mathematical formulation:
+        x' = x_anchor + s * (x - x_anchor)
+        y' = y_anchor + s * (y - y_anchor)
+
+    Where:
+        - x, y are original absolute coordinates.
+        - x', y' are scaled coordinates.
+        - s is the uniform scaling factor computed via compute_text_size_scale.
+        - x_anchor is the horizontal left boundary (bounding-box left reference).
+        - y_anchor is the writing baseline reference estimated via baseline_percentile.
+
+    Preserves:
+        - Exact letter aspect ratio (uniform scaling, no independent horizontal/vertical stretch).
+        - Pen-lift states.
+        - Stroke sequence ordering.
+        - Non-mutating: original strokes array is not modified in-place.
+        - Exact identity when text_size == 0.0.
+
+    Parameters:
+        strokes: Array of shape (N, 3) representing (dx, dy, pen_lift).
+        text_size: Control value in [-1.0, 1.0].
+        config: Optional StyleConfig configuration.
+
+    Returns:
+        modified_strokes: Array of shape (N, 3) with scaled stroke coordinates.
+    """
+    if config is None:
+        config = StyleConfig()
+
+    if config.clamp_controls:
+        text_size = float(np.clip(text_size, -1.0, 1.0))
+
+    if text_size == 0.0:
+        return strokes.copy()
+
+    s = compute_text_size_scale(text_size, config)
+    pos = relative_to_absolute(strokes)
+    pen_lifts = strokes[:, 2:3]
+
+    active_segs = extract_active_segments(strokes, config)
+    if active_segs:
+        x_anchor = float(min(seg['x_min'] for seg in active_segs))
+        visible_y = []
+        for seg in active_segs:
+            visible_y.extend(pos[seg['start']:seg['end'], 1])
+        y_anchor = float(np.percentile(visible_y, config.baseline_percentile))
+    else:
+        x_anchor = float(pos[:, 0].min()) if len(pos) > 0 else 0.0
+        y_anchor = float(np.percentile(pos[:, 1], config.baseline_percentile)) if len(pos) > 0 else 0.0
+
+    pos[:, 0] = x_anchor + s * (pos[:, 0] - x_anchor)
+    pos[:, 1] = y_anchor + s * (pos[:, 1] - y_anchor)
+
+    return absolute_to_relative(pos, pen_lifts, orig_dtype=strokes.dtype)
+
+
 def compute_boldness_linewidth(
     boldness: float,
     config: Optional[StyleConfig] = None
@@ -518,18 +634,20 @@ def apply_all_styles(
     word_spacing: float = 0.0,
     italics: float = 0.0,
     boldness: float = 0.0,
+    text_size: float = 0.0,
     config: Optional[StyleConfig] = None,
     attention_map: Optional[np.ndarray] = None
 ) -> Tuple[np.ndarray, float]:
     """
-    Applies all four mathematical style controllers in a unified, orthogonal pipeline.
+    Applies all five mathematical style controllers in a unified, orthogonal pipeline.
 
     Order of operations:
     1. Zero-Control Bypass: If all controls are 0.0, returns an exact unmodified copy.
     2. Character Spacing: Shifts intra-word character clusters and accumulates word offsets.
     3. Word Spacing: Shifts words horizontally by word index.
     4. Italics (Slant): Applies horizontal shear on absolute coordinates.
-    5. Boldness: Computes the rendering stroke thickness parameter.
+    5. Text Size: Applies uniform scaling relative to left boundary and baseline anchor.
+    6. Boldness: Computes the rendering stroke thickness parameter.
 
     Parameters:
         strokes: Array of shape (N, 3) representing (dx, dy, pen_lift).
@@ -538,6 +656,7 @@ def apply_all_styles(
         word_spacing: Normalized word spacing in [-1.0, 1.0].
         italics: Normalized italics (slant) in [-1.0, 1.0].
         boldness: Normalized stroke thickness in [-1.0, 1.0].
+        text_size: Normalized handwriting size in [-1.0, 1.0].
         config: Central configuration object.
         attention_map: Optional cross-attention map from diffusion model.
 
@@ -553,18 +672,18 @@ def apply_all_styles(
         word_spacing = float(np.clip(word_spacing, -1.0, 1.0))
         italics = float(np.clip(italics, -1.0, 1.0))
         boldness = float(np.clip(boldness, -1.0, 1.0))
+        text_size = float(np.clip(text_size, -1.0, 1.0))
 
     # CRITICAL REQUIREMENT: Exact Zero-Control Identity Bypass
-    # If all four controls are zero, bypass all transformations completely.
     is_zero_control = (char_spacing == 0.0 and word_spacing == 0.0 and
-                       italics == 0.0 and boldness == 0.0)
+                       italics == 0.0 and boldness == 0.0 and text_size == 0.0)
     if is_zero_control:
         return strokes.copy(), config.default_linewidth
 
     linewidth = compute_boldness_linewidth(boldness, config)
 
     # If no geometric controls are active, return original stroke copy
-    if char_spacing == 0.0 and word_spacing == 0.0 and italics == 0.0:
+    if char_spacing == 0.0 and word_spacing == 0.0 and italics == 0.0 and text_size == 0.0:
         return strokes.copy(), linewidth
 
     pos = relative_to_absolute(strokes)
@@ -635,13 +754,460 @@ def apply_all_styles(
         k = italics * config.max_slant_factor
         pos[:, 0] += k * (pos[:, 1] - y_base)
 
+    if text_size != 0.0:
+        s = compute_text_size_scale(text_size, config)
+        active_segs = extract_active_segments(strokes, config)
+        if active_segs:
+            x_anchor = float(min(seg['x_min'] for seg in active_segs))
+            visible_y = []
+            for seg in active_segs:
+                visible_y.extend(pos[seg['start']:seg['end'], 1])
+            y_anchor = float(np.percentile(visible_y, config.baseline_percentile))
+        else:
+            x_anchor = float(pos[:, 0].min()) if len(pos) > 0 else 0.0
+            y_anchor = float(np.percentile(pos[:, 1], config.baseline_percentile)) if len(pos) > 0 else 0.0
+
+        pos[:, 0] = x_anchor + s * (pos[:, 0] - x_anchor)
+        pos[:, 1] = y_anchor + s * (pos[:, 1] - y_anchor)
+
     modified_strokes = absolute_to_relative(pos, pen_lifts, orig_dtype=strokes.dtype)
     return modified_strokes, linewidth
 
 
-# ==============================================================================
-# End-to-End Generation Convenience Interface
-# ==============================================================================
+def layout_multiline_strokes(
+    lines_strokes: List[Optional[np.ndarray]],
+    line_spacing: float = 0.0,
+    config: Optional[StyleConfig] = None,
+    x_margin: float = 0.0
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """
+    Arranges multiple lines of handwriting strokes into a single vertically organized stroke sequence.
+
+    Each line has its own independent starting position:
+        x' = x + x_offset[i]
+        y' = y + y_offset[i]
+
+    Lines are ordered top-to-bottom.
+    Calculates actual bounding boxes for each generated line to ensure lines do not overlap.
+    Preserves empty lines as blank line layout gaps.
+
+    Parameters:
+        lines_strokes: List of stroke arrays (shape (N_i, 3)) or None for blank lines.
+        line_spacing: Normalized line spacing control in [-1.0, 1.0] (or positive spacing multiplier).
+        config: Optional StyleConfig instance.
+        x_margin: Horizontal left margin offset in coordinate units.
+
+    Returns:
+        combined_strokes: Array of shape (total_N, 3) representing the unified multiline stroke sequence.
+        line_infos: List of dicts describing the bounding box and position of each line.
+    """
+    if config is None:
+        config = StyleConfig()
+
+    if config.clamp_controls and -1.0 <= line_spacing <= 1.0:
+        line_spacing = float(np.clip(line_spacing, -1.0, 1.0))
+
+    line_boxes = []
+    valid_heights = []
+    for strokes in lines_strokes:
+        if strokes is not None and len(strokes) > 0:
+            pos = relative_to_absolute(strokes)
+            x_min, x_max = float(pos[:, 0].min()), float(pos[:, 0].max())
+            y_min, y_max = float(pos[:, 1].min()), float(pos[:, 1].max())
+            h = max(0.1, y_max - y_min)
+            valid_heights.append(h)
+            line_boxes.append({
+                'pos': pos,
+                'pen_lifts': strokes[:, 2:3],
+                'x_min': x_min,
+                'x_max': x_max,
+                'y_min': y_min,
+                'y_max': y_max,
+                'h': h,
+                'dtype': strokes.dtype
+            })
+        else:
+            line_boxes.append(None)
+
+    nom_h = float(np.mean(valid_heights)) if valid_heights else 6.0
+
+    if -1.0 <= line_spacing <= 1.0:
+        gap = nom_h * max(0.1, 0.5 + 0.5 * line_spacing)
+    else:
+        gap = nom_h * max(0.1, 0.5 * (1.0 + line_spacing))
+
+    y_cursor = 0.0
+    translated_positions = []
+    translated_pen_lifts = []
+    line_infos = []
+
+    for idx, box in enumerate(line_boxes):
+        if box is None:
+            y_cursor -= (nom_h + gap)
+            line_infos.append({
+                'line_index': idx,
+                'is_empty': True,
+                'y_top': y_cursor + nom_h + gap,
+                'y_bottom': y_cursor
+            })
+            continue
+
+        pos = box['pos'].copy()
+        pl = box['pen_lifts'].copy()
+        pl[-1] = 1.0
+
+        x_off = -box['x_min'] + x_margin
+        y_top = y_cursor
+        y_off = y_top - box['y_max']
+
+        pos[:, 0] += x_off
+        pos[:, 1] += y_off
+
+        y_bottom = y_top - box['h']
+        y_cursor = y_bottom - gap
+
+        translated_positions.append(pos)
+        translated_pen_lifts.append(pl)
+        line_infos.append({
+            'line_index': idx,
+            'is_empty': False,
+            'x_offset': x_off,
+            'y_offset': y_off,
+            'y_top': y_top,
+            'y_bottom': y_bottom,
+            'height': box['h']
+        })
+
+    if not translated_positions:
+        dummy = np.zeros((1, 3), dtype=np.float32)
+        dummy[0, 2] = 1.0
+        return dummy, line_infos
+
+    all_pos = np.vstack(translated_positions)
+    all_pl = np.vstack(translated_pen_lifts)
+    combined_strokes = absolute_to_relative(
+        all_pos,
+        all_pl,
+        orig_dtype=line_boxes[0]['dtype'] if line_boxes[0] else np.float32
+    )
+    return combined_strokes, line_infos
+
+
+def calculate_word_stroke_boxes(
+    strokes: np.ndarray,
+    text: str,
+    config: Optional[StyleConfig] = None
+) -> List[Dict[str, Any]]:
+    """
+    Calculates the exact bounding box, dimensions, and stroke slice for each word
+    in the generated handwriting.
+
+    Uses actual stroke coordinates rather than character counts or heuristics.
+
+    Parameters:
+        strokes: Array of shape (N, 3) representing (dx, dy, pen_lift).
+        text: Text string corresponding to strokes.
+        config: Optional StyleConfig instance.
+
+    Returns:
+        word_boxes: List of dicts describing each word:
+            - word: Word text string
+            - strokes: Stroke slice array (N_w, 3)
+            - pos: Absolute coordinates of slice (N_w, 2)
+            - start_idx, end_idx: Indices in original strokes array
+            - x_min, x_max: Horizontal bounding box
+            - y_min, y_max: Vertical bounding box
+            - width: Actual horizontal width (x_max - x_min)
+            - height: Actual vertical height (y_max - y_min)
+            - trailing_gap: Horizontal distance to start of next word (or 0.0)
+    """
+    if config is None:
+        config = StyleConfig()
+
+    words = [w for w in text.split(' ') if w]
+    num_words = len(words)
+    pos = relative_to_absolute(strokes) if len(strokes) > 0 else np.zeros((0, 2), dtype=np.float64)
+
+    if num_words <= 1 or len(strokes) == 0:
+        x_min = float(pos[:, 0].min()) if len(pos) > 0 else 0.0
+        x_max = float(pos[:, 0].max()) if len(pos) > 0 else 0.0
+        y_min = float(pos[:, 1].min()) if len(pos) > 0 else 0.0
+        y_max = float(pos[:, 1].max()) if len(pos) > 0 else 0.0
+        return [{
+            'word': text.strip(),
+            'strokes': strokes.copy(),
+            'pos': pos.copy(),
+            'start_idx': 0,
+            'end_idx': len(strokes),
+            'x_min': x_min,
+            'x_max': x_max,
+            'y_min': y_min,
+            'y_max': y_max,
+            'width': max(0.01, x_max - x_min),
+            'height': max(0.01, y_max - y_min),
+            'trailing_gap': 0.0
+        }]
+
+    word_boundaries = find_word_boundaries(strokes, text, config)
+    word_boxes = []
+
+    for w_idx in range(num_words):
+        start = word_boundaries[w_idx - 1] if w_idx > 0 else 0
+        end = word_boundaries[w_idx] if w_idx < len(word_boundaries) else len(strokes)
+        if end <= start:
+            continue
+
+        w_strokes = strokes[start:end].copy()
+        w_pos = pos[start:end]
+
+        x_min = float(w_pos[:, 0].min())
+        x_max = float(w_pos[:, 0].max())
+        y_min = float(w_pos[:, 1].min())
+        y_max = float(w_pos[:, 1].max())
+        width = max(0.01, x_max - x_min)
+        height = max(0.01, y_max - y_min)
+
+        if w_idx < len(word_boundaries) and word_boundaries[w_idx] < len(pos):
+            next_start = word_boundaries[w_idx]
+            trailing_gap = max(0.5, float(pos[next_start, 0] - x_max))
+        else:
+            trailing_gap = 0.0
+
+        word_boxes.append({
+            'word': words[w_idx],
+            'strokes': w_strokes,
+            'pos': w_pos,
+            'start_idx': start,
+            'end_idx': end,
+            'x_min': x_min,
+            'x_max': x_max,
+            'y_min': y_min,
+            'y_max': y_max,
+            'width': width,
+            'height': height,
+            'trailing_gap': trailing_gap
+        })
+
+    return word_boxes
+
+
+def build_line_strokes_from_boxes(word_boxes: List[Dict[str, Any]]) -> np.ndarray:
+    """
+    Assembles a list of word stroke boxes into a continuous single-line stroke sequence.
+    Preserves word internal relative coordinates, pen lifts, and horizontal word gaps.
+    """
+    if not word_boxes:
+        dummy = np.zeros((1, 3), dtype=np.float32)
+        dummy[0, 2] = 1.0
+        return dummy
+
+    if len(word_boxes) == 1:
+        st = word_boxes[0]['strokes'].copy()
+        st[-1, 2] = 1.0
+        return st
+
+    line_positions = []
+    line_pen_lifts = []
+    x_cursor = 0.0
+
+    for i, w_info in enumerate(word_boxes):
+        w_pos = w_info['pos'].copy()
+        pl = w_info['strokes'][:, 2:3].copy()
+        w_xmin = w_info['x_min']
+
+        w_pos[:, 0] += (x_cursor - w_xmin)
+        line_positions.append(w_pos)
+        line_pen_lifts.append(pl)
+
+        x_cursor += w_info['width'] + w_info['trailing_gap']
+
+    combined_pos = np.vstack(line_positions)
+    combined_pl = np.vstack(line_pen_lifts)
+    combined_pl[-1] = 1.0
+
+    return absolute_to_relative(
+        combined_pos,
+        combined_pl,
+        orig_dtype=word_boxes[0]['strokes'].dtype
+    )
+
+
+def wrap_strokes_by_word(
+    strokes: np.ndarray,
+    text: str,
+    available_width_coords: float,
+    line_spacing: float = 0.0,
+    config: Optional[StyleConfig] = None,
+    x_margin: float = 0.0
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """
+    Automatically wraps words to subsequent lines when exceeding available horizontal canvas width.
+
+    Key guarantees:
+    - Words are never split across lines.
+    - Explicit newlines ('\\n') are preserved as manual line breaks.
+    - Consecutive newlines ('\\n\\n') preserve empty lines.
+    - Word widths and line breaks are determined using actual stroke bounding boxes.
+    - Single word wider than available canvas width triggers an explicit warning without distortion or shrinking.
+    - Lines are laid out with layout_multiline_strokes without vertical overlap.
+
+    Parameters:
+        strokes: Array of shape (N, 3) representing (dx, dy, pen_lift).
+        text: Text string corresponding to strokes (may contain '\\n').
+        available_width_coords: Maximum horizontal space available for writing (in coordinate units).
+        line_spacing: Configurable line spacing control [-1.0, 1.0].
+        config: Optional StyleConfig instance.
+        x_margin: Left margin offset in coordinate units.
+
+    Returns:
+        combined_strokes: Array of shape (total_N, 3) with wrapped multiline strokes.
+        line_infos: List of line metadata dicts.
+    """
+    import warnings
+
+    if config is None:
+        config = StyleConfig()
+
+    paragraphs = text.split('\n')
+    lines_strokes: List[Optional[np.ndarray]] = []
+
+    all_words = [w for w in text.replace('\n', ' ').split(' ') if w]
+    all_word_boxes = calculate_word_stroke_boxes(strokes, ' '.join(all_words), config)
+
+    box_cursor = 0
+    for para in paragraphs:
+        para_words = [w for w in para.split(' ') if w]
+        if not para_words:
+            lines_strokes.append(None)
+            continue
+
+        num_p_words = len(para_words)
+        para_boxes = all_word_boxes[box_cursor:box_cursor + num_p_words]
+        box_cursor += num_p_words
+
+        if not para_boxes:
+            continue
+
+        current_line_boxes: List[Dict[str, Any]] = []
+        current_line_width = 0.0
+
+        for w_info in para_boxes:
+            w_width = w_info['width']
+            gap = current_line_boxes[-1]['trailing_gap'] if current_line_boxes else 0.0
+
+            if w_width > available_width_coords:
+                warnings.warn(
+                    f"Word '{w_info['word']}' width ({w_width:.1f} units) exceeds available horizontal "
+                    f"canvas width ({available_width_coords:.1f} units). Preserving word intact without splitting or distortion."
+                )
+                if current_line_boxes:
+                    lines_strokes.append(build_line_strokes_from_boxes(current_line_boxes))
+                    current_line_boxes = []
+                    current_line_width = 0.0
+                lines_strokes.append(build_line_strokes_from_boxes([w_info]))
+                continue
+
+            needed_width = (current_line_width + gap + w_width) if current_line_boxes else w_width
+            if current_line_boxes and (needed_width > available_width_coords):
+                lines_strokes.append(build_line_strokes_from_boxes(current_line_boxes))
+                current_line_boxes = [w_info]
+                current_line_width = w_width
+            else:
+                current_line_boxes.append(w_info)
+                current_line_width = needed_width
+
+        if current_line_boxes:
+            lines_strokes.append(build_line_strokes_from_boxes(current_line_boxes))
+
+    if not lines_strokes:
+        return strokes.copy(), []
+
+    return layout_multiline_strokes(
+        lines_strokes,
+        line_spacing=line_spacing,
+        config=config,
+        x_margin=x_margin
+    )
+
+
+def calculate_dynamic_canvas_dimensions(
+    strokes: np.ndarray,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    config: Optional[StyleConfig] = None,
+    pixels_per_unit: float = 15.0,
+    margin_ratio_x: float = 0.05,
+    margin_ratio_y: float = 0.10
+) -> Tuple[int, int]:
+    """
+    Computes canvas pixel dimensions under exactly three sizing modes (no --max_size CLI arg):
+
+    Mode 1 (Neither width nor height specified: width is None and height is None):
+        Smallest reasonable canvas calculated dynamically from stroke bounding boxes + margins,
+        clamped to DEFAULT_MAX_CANVAS_WIDTH (1400) and DEFAULT_MAX_CANVAS_HEIGHT (1400).
+        Short text is never enlarged to fill the maximum canvas.
+
+    Mode 2 (Width specified, height unspecified: width is not None and height is None):
+        Canvas width is exactly the specified width; height is dynamically calculated
+        from wrapped lines and bounding box, clamped to DEFAULT_MAX_CANVAS_HEIGHT (1400).
+
+    Mode 3 (Height specified, width unspecified: height is not None and width is None):
+        Canvas height is exactly the specified height; width is dynamically calculated
+        from widest line and bounding box, clamped to DEFAULT_MAX_CANVAS_WIDTH (1400).
+
+    Fixed Mode (Both width and height specified):
+        Canvas width and height are exactly the specified values.
+
+    Parameters:
+        strokes: Array of shape (N, 3) representing (dx, dy, pen_lift).
+        width: Optional specified canvas width in pixels.
+        height: Optional specified canvas height in pixels.
+        config: Optional StyleConfig instance.
+        pixels_per_unit: Coordinate scale factor (default: 15.0 px/unit).
+        margin_ratio_x: Horizontal margin ratio (default: 0.05).
+        margin_ratio_y: Vertical margin ratio (default: 0.10).
+
+    Returns:
+        (canvas_width, canvas_height): Integer pixel dimensions.
+    """
+    if config is None:
+        config = StyleConfig()
+
+    max_w = getattr(config, 'max_canvas_width', DEFAULT_MAX_CANVAS_WIDTH)
+    max_h = getattr(config, 'max_canvas_height', DEFAULT_MAX_CANVAS_HEIGHT)
+
+    pos = relative_to_absolute(strokes) if strokes is not None and len(strokes) > 0 else np.zeros((1, 2))
+    if len(pos) > 0:
+        w_stroke = float(np.max(pos[:, 0]) - np.min(pos[:, 0]))
+        h_stroke = float(np.max(pos[:, 1]) - np.min(pos[:, 1]))
+    else:
+        w_stroke = 1.0
+        h_stroke = 1.0
+
+    w_needed_coords = max(1.0, w_stroke / max(0.1, 1.0 - 2.0 * margin_ratio_x))
+    h_needed_coords = max(1.0, h_stroke / max(0.1, 1.0 - 2.0 * margin_ratio_y))
+
+    dynamic_w_px = int(np.ceil(w_needed_coords * pixels_per_unit))
+    dynamic_h_px = int(np.ceil(h_needed_coords * pixels_per_unit))
+
+    dynamic_w_px = max(100, dynamic_w_px)
+    dynamic_h_px = max(50, dynamic_h_px)
+
+    if width is not None and height is not None:
+        final_w = int(width)
+        final_h = int(height)
+    elif width is None and height is None:
+        final_w = min(dynamic_w_px, max_w)
+        final_h = min(dynamic_h_px, max_h)
+    elif width is not None and height is None:
+        final_w = int(width)
+        final_h = min(dynamic_h_px, max_h)
+    else:
+        final_w = min(dynamic_w_px, max_w)
+        final_h = int(height)
+
+    return final_w, final_h
+
 
 def generate_handwriting(
     text: str,
@@ -649,12 +1215,18 @@ def generate_handwriting(
     word_spacing: float = 0.0,
     italics: float = 0.0,
     boldness: float = 0.0,
+    text_size: float = 0.0,
+    line_spacing: float = 0.0,
     writersource: Optional[str] = None,
     output_path: Optional[str] = None,
     show_sample: bool = False,
     weights_path: str = './weights/model_weights.h5',
     diffmode: str = 'new',
     seqlen: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    autowrap: int = 0,
+    fit_overflow: bool = False,
     style_config: Optional[StyleConfig] = None,
     model: Any = None,
     style_extractor: Any = None
@@ -663,25 +1235,32 @@ def generate_handwriting(
     High-level end-to-end interface to generate stylized handwriting using the diffusion model.
 
     Workflow:
-    1. User provides text.
+    1. User provides text (single line or multiline with '\n').
     2. Original diffusion model generates base handwriting strokes.
-    3. User provides four style-control values.
+    3. User provides five style-control values (char_spacing, word_spacing, italics, boldness, text_size).
     4. Mathematical style-control module modifies the generated strokes.
-    5. Modified strokes are rendered with the calculated boldness linewidth.
-    6. Final handwriting image is displayed or saved.
+    5. If multiline, arranges lines with automatic vertical positioning and line spacing.
+    6. Modified strokes are rendered with the calculated boldness linewidth on a fixed canvas.
+    7. Final handwriting image is displayed or saved.
 
     Parameters:
-        text: Text string to generate.
+        text: Text string to generate (may contain newline characters).
         character_spacing: Normalized character spacing in [-1.0, 1.0].
         word_spacing: Normalized word spacing in [-1.0, 1.0].
         italics: Normalized italics (slant) in [-1.0, 1.0].
         boldness: Normalized stroke thickness in [-1.0, 1.0].
+        text_size: Normalized text size in [-1.0, 1.0].
+        line_spacing: Normalized line spacing in [-1.0, 1.0].
         writersource: Optional path to writer style image (random asset if None).
         output_path: Optional path to save image (e.g. './output.png').
         show_sample: Whether to display sample popup.
         weights_path: Path to diffusion model weights.
         diffmode: Diffusion sampling mode ('new' or 'standard').
         seqlen: Stroke sequence length (default 16 * length of text).
+        canvas_width: Optional fixed canvas width in pixels.
+        canvas_height: Optional fixed canvas height in pixels.
+        multiline: Force multiline generation mode (also auto-enabled if '\n' in text).
+        fit_overflow: Whether to uniformly scale down if text overflows canvas.
         style_config: Optional StyleConfig instance.
         model: Optional pre-loaded DiffusionWriter model to avoid reloading.
         style_extractor: Optional pre-loaded StyleExtractor.
@@ -741,6 +1320,12 @@ def generate_handwriting(
         word_spacing=word_spacing,
         italics=italics,
         boldness=boldness,
+        text_size=text_size,
+        line_spacing=line_spacing,
+        width=width,
+        height=height,
+        autowrap=autowrap,
+        fit_overflow=fit_overflow,
         style_config=style_config
     )
 

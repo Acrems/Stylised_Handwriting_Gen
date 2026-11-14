@@ -1,5 +1,12 @@
+import os
+import tempfile
+os.environ.setdefault('MPLCONFIGDIR', tempfile.gettempdir())
+
 import numpy as np
-import tensorflow as tf
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
 import matplotlib.pyplot as plt
 import string
 import pickle
@@ -15,27 +22,90 @@ def get_beta_set():
     beta_set = 0.02 + explin(1e-5, 0.4, 60)
     return beta_set
     
-def show(strokes, name='', show_output=True, scale=1, linewidth=None):
-    positions = np.cumsum(strokes, axis=0).T[:2]
-    prev_ind = 0
-    W, H = np.max(positions, axis=-1) - np.min(positions, axis=-1)
-    plt.figure(figsize=(scale * W/H, scale))
+def show(strokes, name='', show_output=True, scale=1, linewidth=None,
+         width=None, height=None, dpi=100, margin=None, fit_overflow=False):
+    import style_controller
+    import warnings
+
+    canvas_w, canvas_h = style_controller.calculate_dynamic_canvas_dimensions(
+        strokes,
+        width=width,
+        height=height
+    )
+
+    fig = plt.figure(figsize=(canvas_w / dpi, canvas_h / dpi), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis('off')
+
+    pixels_per_unit = 15.0
+    W_canvas = canvas_w / pixels_per_unit
+    H_canvas = canvas_h / pixels_per_unit
+
+    if margin is None:
+        margin_x = 0.05 * W_canvas
+        margin_y = 0.10 * H_canvas
+    elif isinstance(margin, (int, float)):
+        margin_x = float(margin)
+        margin_y = float(margin)
+    else:
+        margin_x, margin_y = float(margin[0]), float(margin[1])
+
+    W_avail = max(0.1, W_canvas - 2 * margin_x)
+    H_avail = max(0.1, H_canvas - 2 * margin_y)
+
+    positions = np.cumsum(strokes[:, :2], axis=0).T
+    x_min, x_max = float(np.min(positions[0])), float(np.max(positions[0]))
+    y_min, y_max = float(np.min(positions[1])), float(np.max(positions[1]))
+    W_stroke = max(0.01, x_max - x_min)
+    H_stroke = max(0.01, y_max - y_min)
+
+    if W_stroke > W_avail or H_stroke > H_avail:
+        if fit_overflow:
+            scale_fit = min(W_avail / W_stroke, H_avail / H_stroke)
+            warnings.warn(
+                f"Handwriting dimensions ({W_stroke:.1f}x{H_stroke:.1f}) exceed available "
+                f"canvas area ({W_avail:.1f}x{H_avail:.1f}). Uniformly scaled by {scale_fit:.3f} to fit canvas."
+            )
+            x_pos = x_min + scale_fit * (positions[0] - x_min)
+            y_pos = y_max + scale_fit * (positions[1] - y_max)
+            x_min, x_max = float(np.min(x_pos)), float(np.max(x_pos))
+            y_min, y_max = float(np.min(y_pos)), float(np.max(y_pos))
+        else:
+            warnings.warn(
+                f"Handwriting dimensions ({W_stroke:.1f}x{H_stroke:.1f}) exceed available "
+                f"canvas area ({W_avail:.1f}x{H_avail:.1f}). Content will overflow canvas boundaries without cropping or shrinking."
+            )
+            x_pos = positions[0].copy()
+            y_pos = positions[1].copy()
+    else:
+        x_pos = positions[0].copy()
+        y_pos = positions[1].copy()
+
+    x_pos = x_pos - x_min + margin_x
+    y_pos = y_pos - y_max + (H_canvas - margin_y)
 
     plot_kwargs = {'color': 'black'}
     if linewidth is not None:
         plot_kwargs['linewidth'] = linewidth
 
+    prev_ind = 0
     for ind, value in enumerate(strokes[:, 2]):
-        if value > 0.5: 
-            plt.plot(positions[0][prev_ind:ind], positions[1][prev_ind:ind], **plot_kwargs)
+        if value > 0.5:
+            if ind > prev_ind:
+                ax.plot(x_pos[prev_ind:ind], y_pos[prev_ind:ind], **plot_kwargs)
             prev_ind = ind
-        
-    plt.axis('off')
+
+    ax.set_xlim(0, W_canvas)
+    ax.set_ylim(0, H_canvas)
+    ax.set_aspect('equal')
+
     if name:
         save_path = name if name.endswith('.png') else name + '.png'
-        plt.savefig(save_path, bbox_inches='tight')
-    if show_output:  plt.show()
-    else: plt.close()
+        plt.savefig(save_path, dpi=dpi)
+    if show_output:
+        plt.show()
+    else:
+        plt.close(fig)
     
 def get_alphas(batch_size, alpha_set): 
     alpha_indices = tf.random.uniform([batch_size, 1], maxval=len(alpha_set) - 1, dtype=tf.int32)
@@ -59,14 +129,104 @@ def new_diffusion_step(xt, eps, beta, alpha, alpha_next):
 def run_batch_inference(model, beta_set, text, style, tokenizer=None, time_steps=480, 
                         diffusion_mode='new', show_every=None, show_samples=True, path=None,
                         char_spacing=0.0, word_spacing=0.0, italics=0.0, boldness=0.0,
-                        style_config=None):
+                        text_size=0.0, line_spacing=0.0, width=None, height=None,
+                        autowrap=0, fit_overflow=False, style_config=None):
+    if tf is None:
+        raise ImportError(
+            "TensorFlow is required to run diffusion inference, but is not installed in the current environment."
+        )
+
+    should_autowrap = (autowrap == 1)
+
+    import style_controller
+    if style_config is None:
+        style_config = style_controller.StyleConfig()
+
+    if width is not None:
+        avail_w_coords = (width / 15.0) * (1.0 - 2.0 * 0.05)
+    else:
+        avail_w_coords = (style_controller.DEFAULT_MAX_CANVAS_WIDTH / 15.0) * (1.0 - 2.0 * 0.05)
+
+    if isinstance(text, str) and '\n' in text:
+        raw_lines = text.split('\n')
+        line_strokes_list = []
+        last_lw = style_config.default_linewidth
+
+        for line_str in raw_lines:
+            trimmed = line_str.strip()
+            if not trimmed:
+                line_strokes_list.append(None)
+                continue
+
+            line_tokenized = tf.constant([tokenizer.encode(line_str)])
+            line_timesteps = len(line_str) * 16 if time_steps is None else (time_steps if time_steps != 480 else len(line_str) * 16)
+            line_timesteps = line_timesteps - (line_timesteps % 8) + 8
+            line_timesteps = max(16, line_timesteps)
+
+            L = len(beta_set)
+            alpha_set = tf.math.cumprod(1 - beta_set)
+            x_line = tf.random.normal([1, line_timesteps, 2])
+
+            for step_i in range(L - 1, -1, -1):
+                alpha = alpha_set[step_i] * tf.ones([1, 1, 1])
+                beta = beta_set[step_i] * tf.ones([1, 1, 1])
+                a_next = alpha_set[step_i - 1] if step_i > 1 else 1.0
+                model_out, pen_lifts, att = model(x_line, line_tokenized, tf.sqrt(alpha), style)
+                if diffusion_mode == 'standard':
+                    x_line = standard_diffusion_step(x_line, model_out, beta, alpha, add_sigma=bool(step_i))
+                else:
+                    x_line = new_diffusion_step(x_line, model_out, beta, alpha, a_next)
+
+            x_line = tf.concat([x_line, pen_lifts], axis=-1)
+            raw_line_strokes = x_line.numpy()[0]
+
+            mod_line_strokes, last_lw = style_controller.apply_all_styles(
+                raw_line_strokes,
+                line_str,
+                char_spacing=char_spacing,
+                word_spacing=word_spacing,
+                italics=italics,
+                boldness=boldness,
+                text_size=text_size,
+                config=style_config
+            )
+
+            if should_autowrap:
+                wrapped_para, _ = style_controller.wrap_strokes_by_word(
+                    mod_line_strokes,
+                    line_str,
+                    available_width_coords=avail_w_coords,
+                    line_spacing=line_spacing,
+                    config=style_config
+                )
+                line_strokes_list.append(wrapped_para)
+            else:
+                line_strokes_list.append(mod_line_strokes)
+
+        combined_strokes, _ = style_controller.layout_multiline_strokes(
+            line_strokes_list,
+            line_spacing=line_spacing,
+            config=style_config
+        )
+
+        show(
+            combined_strokes,
+            name=path,
+            show_output=show_samples,
+            linewidth=last_lw,
+            width=width,
+            height=height,
+            fit_overflow=fit_overflow
+        )
+        return np.array([combined_strokes])
+
     raw_text = text if isinstance(text, (str, list)) else None
     if isinstance(text, str):
-        text = tf.constant([tokenizer.encode(text)+[1]])
+        text = tf.constant([tokenizer.encode(text)])
     elif isinstance(text, list) and isinstance(text[0], str):
         tmp = []
         for i in text:
-            tmp.append(tokenizer.encode(i)+[1])
+            tmp.append(tokenizer.encode(i))
         text = tf.constant(tmp)
 
     bs = text.shape[0]
@@ -92,15 +252,6 @@ def run_batch_inference(model, beta_set, text, style, tokenizer=None, time_steps
     x = tf.concat([x, pen_lifts], axis=-1)
     raw_strokes = x.numpy()
 
-    has_style = (char_spacing != 0.0 or word_spacing != 0.0 or
-                 italics != 0.0 or boldness != 0.0)
-
-    if not has_style:
-        for i in range(bs):
-            show(raw_strokes[i], scale=1, show_output=show_samples, name=path)
-        return raw_strokes
-
-    import style_controller
     final_strokes = []
     for i in range(bs):
         curr_text = raw_text if isinstance(raw_text, str) else (raw_text[i] if raw_text is not None else "")
@@ -111,11 +262,21 @@ def run_batch_inference(model, beta_set, text, style, tokenizer=None, time_steps
             word_spacing=word_spacing,
             italics=italics,
             boldness=boldness,
+            text_size=text_size,
             config=style_config,
             attention_map=att[i].numpy() if 'att' in locals() else None
         )
+        if should_autowrap and curr_text:
+            mod_strokes, _ = style_controller.wrap_strokes_by_word(
+                mod_strokes,
+                curr_text,
+                available_width_coords=avail_w_coords,
+                line_spacing=line_spacing,
+                config=style_config
+            )
         final_strokes.append(mod_strokes)
-        show(mod_strokes, scale=1, show_output=show_samples, name=path, linewidth=lw)
+        show(mod_strokes, scale=1, show_output=show_samples, name=path, linewidth=lw,
+             width=width, height=height, fit_overflow=fit_overflow)
 
     return np.array(final_strokes)
     
@@ -193,6 +354,6 @@ class Tokenizer:
         return tokenized
     
     def decode(self, tokens):
-        if isinstance(tokens, tf.Tensor): tokens = tokens.numpy()
+        if tf is not None and isinstance(tokens, tf.Tensor): tokens = tokens.numpy()
         text = [self.chars[token] for token in tokens]
         return ''.join(text)
