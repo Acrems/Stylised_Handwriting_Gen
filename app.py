@@ -64,6 +64,7 @@ def generate(text, writer_path, opts, weights_path, channels, num_attlayers):
     import tensorflow as tf
     import utils
     import preprocessing
+    import style_controller
 
     model, style_extractor, tokenizer, beta_set = load_models(weights_path, channels, num_attlayers)
 
@@ -86,6 +87,7 @@ def generate(text, writer_path, opts, weights_path, channels, num_attlayers):
 
     out_path = os.path.join(tempfile.gettempdir(), f"hw_{uuid.uuid4().hex}.png")
 
+    style_config = style_controller.StyleConfig(min_linewidth=0.5, max_linewidth=5.0)
     utils.run_batch_inference(
         model,
         beta_set,
@@ -106,6 +108,7 @@ def generate(text, writer_path, opts, weights_path, channels, num_attlayers):
         height=opts["height"],
         autowrap=1 if opts["autowrap"] else 0,
         fit_overflow=opts["fit_overflow"],
+        style_config=style_config,
     )
     plt.close("all")
 
@@ -156,7 +159,10 @@ with st.sidebar:
     char_spacing = st.slider("Character spacing", -1.0, 1.0, 0.0, 0.05)
     word_spacing = st.slider("Word spacing", -1.0, 1.0, 0.0, 0.05)
     italics = st.slider("Italics (slant)", -1.0, 1.0, 0.0, 0.05)
-    boldness = st.slider("Boldness", -1.0, 1.0, 0.0, 0.05)
+    boldness = st.slider(
+        "Boldness", -1.0, 1.0, 0.0, 0.1,
+        help="Controls rendered pen thickness. Press Generate handwriting to apply the selected value.",
+    )
     text_size = st.slider("Text size", -1.0, 1.0, 0.0, 0.05)
     line_spacing = st.slider("Line spacing (multiline)", -1.0, 1.0, 0.0, 0.05)
 
