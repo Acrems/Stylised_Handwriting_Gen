@@ -6,7 +6,7 @@ import uuid
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
 
-# Make relative paths (./assets, ./weights) work no matter where Streamlit is launched from
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(APP_DIR)
 if APP_DIR not in sys.path:
@@ -25,9 +25,8 @@ ASSET_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 DEFAULT_WEIGHTS = "./weights/model_weights.h5"
 
 
-# --------------------------------------------------------------------------
 # Cached heavy resources
-# --------------------------------------------------------------------------
+
 @st.cache_resource(show_spinner="Loading TensorFlow and model weights (first run only)...")
 def load_models(weights_path: str, channels: int, num_attlayers: int):
     import tensorflow as tf
@@ -75,7 +74,7 @@ def generate(text, writer_path, opts, weights_path, channels, num_attlayers):
     writer_img = tf.expand_dims(preprocessing.read_img(writer_path, 96), 0)
     style_vector = style_extractor(writer_img)
 
-    # Multi-line text: pass None so every line gets its own length-based timesteps
+    # multi linet text: pass None so every line gets its own length-based timesteps
     if "\n" in text:
         time_steps = None
     elif opts["seqlen"]:
@@ -121,10 +120,9 @@ def generate(text, writer_path, opts, weights_path, channels, num_attlayers):
     return png_bytes
 
 
-# --------------------------------------------------------------------------
 # UI
-# --------------------------------------------------------------------------
-st.title("✍️ Stylised Handwriting Generator")
+
+st.title(" Stylised Handwriting Generator")
 st.caption("Diffusion-based handwriting synthesis with style controls for spacing, slant, boldness, size and layout.")
 
 with st.sidebar:
