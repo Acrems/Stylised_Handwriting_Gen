@@ -1,19 +1,3 @@
-"""
-Mathematical Style Control Module for Diffusion-based Handwriting Generation.
-
-This module provides deterministic mathematical transformations to control four
-handwriting characteristics without altering the underlying diffusion model:
-1. Character Spacing: Expands or contracts the horizontal distance between consecutive characters.
-2. Word Spacing: Expands or contracts the horizontal distance between consecutive words.
-3. Italics (Slant): Applies a horizontal shear transformation relative to a baseline reference.
-4. Boldness: Adjusts the rendered stroke thickness in the rendering pipeline.
-
-All controls accept normalized inputs in [-1.0, 1.0]:
-- -1.0: Maximum decrease
--  0.0: Preserves original handwriting (exact zero-control identity)
-- +1.0: Maximum increase
-"""
-
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any, Union
 import numpy as np
@@ -25,32 +9,17 @@ DEFAULT_MAX_CANVAS_HEIGHT: int = 1400
 
 @dataclass
 class StyleConfig:
-    """Central configuration for mathematical handwriting style controllers."""
-
-    # Maximum horizontal displacement for character spacing (in coordinate units)
     max_char_displacement: float = 1.2
-
-    # Maximum horizontal displacement for word spacing (in coordinate units)
     max_word_displacement: float = 5.0
-
-    # Maximum shear factor for italics (tangent of slant angle, e.g. ~20 degrees)
     max_slant_factor: float = 0.35
 
     # Rendering thickness (linewidth) settings
     default_linewidth: float = 1.5
     min_linewidth: float = 0.6
     max_linewidth: float = 3.6
-
-    # Percentile of y-coordinates used to estimate baseline reference
     baseline_percentile: float = 10.0
-
-    # Minimum stroke span to be considered an active drawn stroke (filters stationary padding)
     active_stroke_span_threshold: float = 0.05
-
-    # Horizontal proximity threshold for merging multi-stroke character components (e.g. crossbars)
     char_merge_gap_threshold: float = 0.25
-
-    # Whether to clamp style control values to [-1.0, 1.0]
     clamp_controls: bool = True
 
     min_text_size_scale: float = 0.5
@@ -68,10 +37,6 @@ class StyleConfig:
     default_margin_ratio: float = 0.05
     pixels_per_unit: float = 15.0
 
-
-# ==============================================================================
-# Coordinate Conversion Utilities
-# ==============================================================================
 
 def relative_to_absolute(strokes: np.ndarray) -> np.ndarray:
     """
@@ -121,10 +86,7 @@ def absolute_to_relative(
 
     return np.concatenate([dx, pen_lifts.astype(orig_dtype)], axis=-1)
 
-
-# ==============================================================================
 # Stroke Segmentation and Boundary Detection
-# ==============================================================================
 
 def extract_active_segments(
     strokes: np.ndarray,
