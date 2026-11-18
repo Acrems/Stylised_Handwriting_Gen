@@ -6,11 +6,7 @@ from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.layers import (Dense, Conv1D, Embedding, UpSampling1D, AveragePooling1D, 
 AveragePooling2D, GlobalAveragePooling2D, Activation, LayerNormalization, Dropout, Layer)
 
-def create_padding_mask(seq, repeats=1):
-    seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
-    seq = tf.repeat(seq, repeats=repeats, axis=-1)
-    mask = seq[:, tf.newaxis, tf.newaxis, :]
-    return mask
+
 
 def get_angles(pos, i, C, pos_factor = 1):
     angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(C))
@@ -24,7 +20,7 @@ def positional_encoding(position, C, pos_factor=1):
     angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])    
     pos_encoding = angle_rads[np.newaxis, ...]    
     return tf.cast(pos_encoding, dtype=tf.float32)
-    
+
 def ff_network(C, dff=768, act_before=True):
     ff_layers = [
         Dense(dff, activation='swish'),
@@ -32,6 +28,13 @@ def ff_network(C, dff=768, act_before=True):
     ]
     if act_before: ff_layers.insert(0, Activation('swish'))
     return Sequential(ff_layers)   
+    
+    
+def create_padding_mask(seq, repeats=1):
+    seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
+    seq = tf.repeat(seq, repeats=repeats, axis=-1)
+    mask = seq[:, tf.newaxis, tf.newaxis, :]
+    return mask
     
 def loss_fn(eps, score_pred, pl, pl_pred, abar, bce):
     score_loss = tf.reduce_mean(tf.reduce_sum(tf.square(eps - score_pred), axis=-1)) 

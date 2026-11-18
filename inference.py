@@ -45,7 +45,6 @@ def main():
         import preprocessing
     except ImportError as e:
         print(f"Error: TensorFlow and neural network components required for diffusion inference: {e}")
-        print("Note: Stable official TensorFlow currently supports Python 3.10 - 3.12.")
         sys.exit(1)
 
     textstring = args.textstring.replace('\\n', '\n')

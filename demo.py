@@ -1,17 +1,3 @@
-"""
-Interactive / CLI Demonstration Script for Mathematical Handwriting Style Controllers.
-
-Allows users to specify:
-- Input text string
-- Character spacing (-1.0 to +1.0)
-- Word spacing (-1.0 to +1.0)
-- Italics (slant) (-1.0 to +1.0)
-- Boldness (thickness) (-1.0 to +1.0)
-
-Also provides a --compare flag to generate and visually compare the original handwriting
-(all controls = 0) side-by-side with the styled handwriting.
-"""
-
 import argparse
 import os
 import sys

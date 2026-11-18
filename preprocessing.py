@@ -8,18 +8,15 @@ import argparse
 import string
 from utils import Tokenizer
 
-'''
-Creates the online and offline dataset for training
 
-Before running this script, download the following things from 
+
+'''
 https://fki.tic.heia-fr.ch/databases/download-the-iam-on-line-handwriting-database
 
-data/lineStrokes-all.tar.gz   -   the stroke xml for the online dataset
-data/lineImages-all.tar.gz    -   the images for the offline dataset
-ascii-all.tar.gz              -   the text labels for the dataset
+data/lineStrokes-all.tar.gz  -  the stroke xml for the online dataset
+data/lineImages-all.tar.gz   -  the images for the offline dataset
+ascii-all.tar.gz             -  the text labels for the dataset
 
-extract these contents and put them in the ./data directory (unless otherwise specified)
-they should have the same names, e.g. "lineStrokes-all" (unless otherwise specified)
 '''
 
 def remove_whitespace(img, thresh, remove_middle=False):
@@ -59,7 +56,7 @@ def parse_page_text(dir_path, id):
     line_num = -1
     for l in f.readlines():
         if 'CSR' in l: has_started = True
-        #the text under 'CSR' is correct, the one labeled under 'OCR' is not
+        #the text under 'CSR' is correct
         if has_started:
             if line_num>0: # theres one space after 'CSR'
                 dict[id[:-4]+ '-%02d' % line_num]  = l[:-1]

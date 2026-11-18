@@ -18,7 +18,6 @@ import os
 import sys
 import tempfile
 
-# Ensure Matplotlib uses a writable temp cache directory
 os.environ.setdefault('MPLCONFIGDIR', tempfile.gettempdir())
 
 import unittest
@@ -32,11 +31,7 @@ import utils
 
 
 def make_synthetic_handwriting(text: str = "HELLO WORLD") -> np.ndarray:
-    """
-    Generates deterministic, realistic stroke sequences for arbitrary text strings.
-    Ensures well-defined character clusters and word gaps so tests do not rely on
-    external model weights or datasets.
-    """
+    
     words = text.split(' ')
     all_strokes = []
     for w_idx, word in enumerate(words):
